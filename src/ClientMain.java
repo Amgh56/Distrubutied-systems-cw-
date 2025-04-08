@@ -1,7 +1,7 @@
 import java.io.File;
 import java.io.IOException;
 import java.util.Random;
-
+import java.io.FileWriter;
 public class ClientMain {
 	
 	public static void main(String[] args) throws Exception{
@@ -19,17 +19,26 @@ public class ClientMain {
 		if (!uploadFolder.exists())
 			if (!uploadFolder.mkdir()) throw new RuntimeException("Cannot create 'to_store' folder (folder absolute path: " + uploadFolder.getAbsolutePath() + ")");
 		
+
+		File testFile = new File(uploadFolder, "test1.txt");
+		try (FileWriter writer = new FileWriter(testFile)) {
+			writer.write("Hello from Abdullah!");
+			System.out.println(" File 'test1.txt' created in to_store folder.");
+			} catch (IOException e) {
+			System.err.println("Failed to create test file: " + e.getMessage());
+		}
+
 		// launch a single client
 		testClient(cport, timeout, downloadFolder, uploadFolder);
 		
 		// launch a number of concurrent clients, each doing the same operations
-		for (int i = 0; i < 10; i++) {
-			new Thread() {
-				public void run() {
-					test2Client(cport, timeout, downloadFolder, uploadFolder);
-				}
-			}.start();
-		}
+		// for (int i = 0; i < 10; i++) {
+		// 	new Thread() {
+		// 		public void run() {
+		// 			test2Client(cport, timeout, downloadFolder, uploadFolder);
+		// 		}
+		// 	}.start();
+		// }
 	}
 	
 	public static void test2Client(int cport, int timeout, File downloadFolder, File uploadFolder) {
@@ -51,20 +60,20 @@ public class ClientMain {
 				}
 			}
 			
-			String list[] = null;
-			try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
+			// String list[] = null;
+			// try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
 			
-			for (int i = 0; i < list.length/4; i++) {
-				String fileToRemove = list[random.nextInt(list.length)];
-				try {
-					client.remove(fileToRemove);
-				} catch (Exception e) {
-					System.out.println("Error remove file " + fileToRemove);
-					e.printStackTrace();
-				}
-			}
+			// for (int i = 0; i < list.length/4; i++) {
+			// 	String fileToRemove = list[random.nextInt(list.length)];
+			// 	try {
+			// 		client.remove(fileToRemove);
+			// 	} catch (Exception e) {
+			// 		System.out.println("Error remove file " + fileToRemove);
+			// 		e.printStackTrace();
+			// 	}
+			// }
 			
-			try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
+			// try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
 			
 		} catch(IOException e) {
 			e.printStackTrace();
@@ -83,32 +92,32 @@ public class ClientMain {
 		
 			try { client.connect(); } catch(IOException e) { e.printStackTrace(); return; }
 			
-			try { list(client); } catch(IOException e) { e.printStackTrace(); }
+			// try { list(client); } catch(IOException e) { e.printStackTrace(); }
 			
 			// store first file in the to_store folder twice, then store second file in the to_store folder once
 			File fileList[] = uploadFolder.listFiles();
 			if (fileList.length > 0) {
 				try { client.store(fileList[0]); } catch(IOException e) { e.printStackTrace(); }				
-				try { client.store(fileList[0]); } catch(IOException e) { e.printStackTrace(); }
+				// try { client.store(fileList[0]); } catch(IOException e) { e.printStackTrace(); }
 			}
 			if (fileList.length > 1) {
 				try { client.store(fileList[1]); } catch(IOException e) { e.printStackTrace(); }
 			}
 
-			String list[] = null;
-			try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
+			// String list[] = null;
+			// try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
 			
-			if (list != null)
-				for (String filename : list)
-					try { client.load(filename, downloadFolder); } catch(IOException e) { e.printStackTrace(); }
+			// if (list != null)
+			// 	for (String filename : list)
+			// 		try { client.load(filename, downloadFolder); } catch(IOException e) { e.printStackTrace(); }
 			
-			if (list != null)
-				for (String filename : list)
-					try { client.remove(filename); } catch(IOException e) { e.printStackTrace(); }
-			if (list != null && list.length > 0)
-				try { client.remove(list[0]); } catch(IOException e) { e.printStackTrace(); }
+			// if (list != null)
+			// 	for (String filename : list)
+			// 		try { client.remove(filename); } catch(IOException e) { e.printStackTrace(); }
+			// if (list != null && list.length > 0)
+			// 	try { client.remove(list[0]); } catch(IOException e) { e.printStackTrace(); }
 			
-			try { list(client); } catch(IOException e) { e.printStackTrace(); }
+			// try { list(client); } catch(IOException e) { e.printStackTrace(); }
 			
 		} finally {
 			if (client != null)

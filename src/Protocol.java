@@ -15,7 +15,6 @@ public class Protocol {
 	
 	// messages sent by the Controller
 	public final static String STORE_TO_TOKEN = "STORE_TO";
-	public final static String STORE_IN_PROGRESS = "STORE_IN_PROGRESS";
 	public final static String STORE_COMPLETE_TOKEN = "STORE_COMPLETE";
 	public final static String LOAD_FROM_TOKEN = "LOAD_FROM";
 	public final static String REMOVE_COMPLETE_TOKEN = "REMOVE_COMPLETE";
@@ -32,4 +31,6 @@ public class Protocol {
 	public final static String JOIN_TOKEN = "JOIN";
 	public final static String REBALANCE_STORE_TOKEN = "REBALANCE_STORE";
 	public final static String REBALANCE_COMPLETE_TOKEN = "REBALANCE_COMPLETE";
+	 public static final String FROM_DSTORE = "FROM_DSTORE";
+
 }
