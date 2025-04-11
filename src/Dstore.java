@@ -75,7 +75,39 @@ private static PrintWriter controllerOut;
                 System.out.println("[Dstore] Sent STORE_ACK to controller for: " + filename);
             
             }
+        }if (msg != null && msg.startsWith(Protocol.LOAD_DATA_TOKEN)) {
+    String[] parts = msg.split(" ");
+    if (parts.length == 2) {
+        String filename = parts[1];
+        File file = new File(fileFolder, filename);
+
+        if (file.exists()) {
+            System.out.println("[Dstore] Preparing to send file: " + filename);
+
+            // Send the file content to the client using OutputStream
+            try (BufferedOutputStream outData = new BufferedOutputStream(socket.getOutputStream());
+                 FileInputStream fis = new FileInputStream(file)) {
+
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = fis.read(buffer)) != -1) {
+                    outData.write(buffer, 0, bytesRead);
+                }
+                outData.flush();
+                System.out.println("[Dstore] File " + filename + " sent successfully");
+
+            } catch (IOException e) {
+                System.out.println("[Dstore] Error sending file: " + e.getMessage());
+            }
+
+        } else {
+            // Per spec: if file does not exist, simply close the connection
+            System.out.println("[Dstore] File not found: " + filename + ". Closing socket.");
+            socket.close();
         }
+    }
+}
+
 
     } catch (Exception e) {
         System.out.println("[Dstore] Error handling client: " + e.getMessage());

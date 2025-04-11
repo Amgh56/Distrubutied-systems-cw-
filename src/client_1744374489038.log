@@ -1,0 +1,35 @@
+Connection established to port 12345
+Message sent to port 12345: LIST
+List operation started
+Message received from port 12345: LIST
+List operation successfully completed
+Message sent to port 12345: STORE test1.txt 20
+Store operation started for file test1.txt
+Message received from port 12345: STORE_TO 2000 2001
+Controller replied to store test1.txt in these Dstores: 2000 2001 
+Connection established to port 2000
+Message sent to port 2000: STORE test1.txt 20
+Storing file test1.txt to Dstore 2000
+Message received from port 2000: ACK
+ACK received from Dstore 2000 to store file test1.txt
+Store of file test1.txt to Dstore 2000 successfully completed
+Connection established to port 2001
+Message sent to port 2001: STORE test1.txt 20
+Storing file test1.txt to Dstore 2001
+Message received from port 2001: ACK
+ACK received from Dstore 2001 to store file test1.txt
+Store of file test1.txt to Dstore 2001 successfully completed
+Message received from port 12345: STORE_COMPLETE
+Store operation for file test1.txt completed
+Message sent to port 12345: LIST
+List operation started
+Message received from port 12345: LIST test1.txt
+List operation successfully completed
+Message sent to port 12345: LOAD test1.txt
+Load operation for file test1.txt started
+Message received from port 12345: LOAD_FROM 2000 20
+Controller replied to load file test1.txt (size: 20 bytes) from Dstore 2000
+Connection established to port 2000
+Message sent to port 2000: LOAD_DATA test1.txt
+Loading file test1.txt from Dstore 2000
+Load operation of file test1.txt from Dstore 2000 successfully completed

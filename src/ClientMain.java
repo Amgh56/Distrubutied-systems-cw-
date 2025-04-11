@@ -31,15 +31,17 @@ public class ClientMain {
 		// launch a single client
 		testClient(cport, timeout, downloadFolder, uploadFolder);
 		
-		// launch a number of concurrent clients, each doing the same operations
-		// for (int i = 0; i < 10; i++) {
-		// 	new Thread() {
-		// 		public void run() {
-		// 			test2Client(cport, timeout, downloadFolder, uploadFolder);
-		// 		}
-		// 	}.start();
-		// }
+		//launch a number of concurrent clients, each doing the same operations
+	// 	for (int i = 0; i < 10; i++) {
+	// 		new Thread() {
+	// 			public void run() {
+	// 				test2Client(cport, timeout, downloadFolder, uploadFolder);
+	// 			}
+	// 		}.start();
+	// 	}
+	// }
 	}
+
 	
 	public static void test2Client(int cport, int timeout, File downloadFolder, File uploadFolder) {
 		Client client = null;
@@ -92,7 +94,7 @@ public class ClientMain {
 		
 			try { client.connect(); } catch(IOException e) { e.printStackTrace(); return; }
 			
-			// try { list(client); } catch(IOException e) { e.printStackTrace(); }
+			try { list(client); } catch(IOException e) { e.printStackTrace(); }
 			
 			// store first file in the to_store folder twice, then store second file in the to_store folder once
 			File fileList[] = uploadFolder.listFiles();
@@ -104,12 +106,26 @@ public class ClientMain {
 				try { client.store(fileList[1]); } catch(IOException e) { e.printStackTrace(); }
 			}
 
-			// String list[] = null;
-			// try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
+			// File[] storedFiles = uploadFolder.listFiles();
+			// if (storedFiles != null && storedFiles.length > 0) {
+			// 	for (File file : storedFiles) {
+			// 		String filename = file.getName();
+			// 		try {
+			// 			client.load(filename, downloadFolder);
+			// 		} catch (IOException e) {
+			// 			System.err.println("Error loading file " + filename);
+			// 			e.printStackTrace();
+			// 		}
+			// 	}
+			// }
+
+
+			String list[] = null;
+			try { list = list(client); } catch(IOException e) { e.printStackTrace(); }
 			
-			// if (list != null)
-			// 	for (String filename : list)
-			// 		try { client.load(filename, downloadFolder); } catch(IOException e) { e.printStackTrace(); }
+			if (list != null)
+				for (String filename : list)
+					try { client.load(filename, downloadFolder); } catch(IOException e) { e.printStackTrace(); }
 			
 			// if (list != null)
 			// 	for (String filename : list)
