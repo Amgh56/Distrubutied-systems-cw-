@@ -6,7 +6,7 @@ import java.util.concurrent.*;
 public class Controller {
 static Map<String, List<Integer>> fileToDstores = new ConcurrentHashMap<>();
 static Map<String, Set<Integer>> storeAcks = new ConcurrentHashMap<>();
-static Map<String, PrintWriter> fileToClient = new ConcurrentHashMap<>();
+static Map<String, Socket> fileToClient = new ConcurrentHashMap<>();
 static Map<Socket, Integer> socketToDstorePort = new ConcurrentHashMap<>();
 enum FileStatus {
     STORE_IN_PROGRESS,
@@ -106,25 +106,24 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
  * @param msg Store ack message recieved
  * @param R the replication factor for the file required.
  */
-    private static void handleStoreAck(Socket socket, String msg, int R) {
-   try {
-    System.out.println("[Controller] Received: " + msg);
+   private static void handleStoreAck(Socket socket, String msg, int R) {
+    try {
+        System.out.println("[Controller] Received: " + msg);
 
-     String[] parts = msg.split(" ");
+        String[] parts = msg.split(" ");
         if (parts.length != 2) {
             System.out.println("[Controller] wrong STORE_ACK format");
             return;
         }
 
         String filename = parts[1];
-
         Integer dstorePort = socketToDstorePort.get(socket);
         if (dstorePort == null) {
             System.out.println("[Controller] Unknown socket for STORE_ACK");
             return;
         }
-       
-           List<Integer> assignedDstores = fileToDstores.get(filename);
+
+        List<Integer> assignedDstores = fileToDstores.get(filename);
         if (assignedDstores == null || !assignedDstores.contains(dstorePort)) {
             System.out.println("[Controller] Dstore " + dstorePort + " not assigned for " + filename);
             return;
@@ -134,30 +133,40 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
         storeAcks.get(filename).add(dstorePort);
         System.out.println("[Controller] Added ACK from Dstore " + dstorePort + " for file " + filename);
 
-        System.out.println("[Controller] Ack count for " + filename + ": " + storeAcks.get(filename).size());
-        System.out.println("[Controller] Checking if all ACKs received for " + filename + ": " + storeAcks.get(filename).size() + " / " + R);
+        int ackCount = storeAcks.get(filename).size();
+        System.out.println("[Controller] Ack count for " + filename + ": " + ackCount + " / " + R);
 
-        if (storeAcks.get(filename).size() >= R) {
+        if (ackCount >= R) {
+            FileStatus currentStatus = fileStatus.get(filename);
+            if (currentStatus != FileStatus.STORE_IN_PROGRESS) {
+                System.out.println("[Controller] Skipping STORE_COMPLETE send — status already changed.");
+                return;
+            }
+
             fileStatus.put(filename, FileStatus.STORE_COMPLETE);
             System.out.println("fileStatus updated to COMPLETE for: " + filename);
             System.out.println("Current fileStatus: " + fileStatus);
 
-            PrintWriter clientOut = fileToClient.get(filename);
-            if (clientOut != null) {
+            Socket clientSocket = fileToClient.get(filename);
+            if (clientSocket != null && !clientSocket.isClosed()) {
+                PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
                 clientOut.println(Protocol.STORE_COMPLETE_TOKEN);
                 System.out.println("[Controller] sent STORE_COMPLETE to client for: " + filename);
-                fileToClient.remove(filename);
-                storeAcks.remove(filename);
             } else {
-                System.out.println("[Controller] there is no client for this file: " + filename);
+                System.out.println("[Controller] No valid client socket for file: " + filename);
             }
+
+            // Clean up
+            fileToClient.remove(filename);
+            storeAcks.remove(filename);
         }
-    
+
     } catch (Exception e) {
         System.out.println("[Controller] Error handling STORE_ACK: " + e.getMessage());
+        e.printStackTrace();
     }
-
 }
+
 
 
     /**
@@ -202,9 +211,6 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
 
         }
 
-
-
-
     if (msg.startsWith(Protocol.STORE_TOKEN)) {
         String[] parts = msg.split(" ");
         if (parts.length == 3) {
@@ -228,7 +234,7 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
             return;
         }
             fileStatus.put(filename, FileStatus.STORE_IN_PROGRESS);
-            fileToClient.put(filename, out);
+            fileToClient.put(filename, socket);
 
             List<Integer> selectedDstores = dstorePorts.subList(0, R);
             fileToDstores.put(filename, selectedDstores);
@@ -238,7 +244,13 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
                 response.append(" ").append(port);
             }
 
-            out.println(response.toString());
+            try {
+            PrintWriter freshOut = new PrintWriter(socket.getOutputStream(), true);
+            freshOut.println(response);
+        } catch (IOException e) {
+            System.out.println("[Controller] Failed to respond to client: " + e.getMessage());
+        }
+            // out.println(response.toString());
             System.out.println("[Controller] Sent to client: " + response);
 
             new Thread(() -> {
@@ -275,12 +287,11 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
 /**
  * Handles the LIST request from the client.
  * Sends back a list of all stored files in STORE_COMPLETE status.
- * @param out
- * @param dstorePorts 
- * @param R 
+ * @param out respond to the client server.
+ * @param dstorePorts save the ports of the dstore files.
+ * @param R the replication number .
  */
 private static void handleListRequest(PrintWriter out, List<Integer> dstorePorts, int R) {
-    // Step 1: Check if we have enough Dstores
     if (dstorePorts.size() < R) {
         out.println(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
         System.out.println("[Controller]  Not enough Dstores to serve LIST request.");
