@@ -21,6 +21,8 @@ private static PrintWriter controllerOut;
 
         controllerOut = new PrintWriter(controllerSocket.getOutputStream(), true);
         controllerOut.println(Protocol.JOIN_TOKEN +  " "  + port);  
+        new Thread(() -> handleControllerCommands(controllerSocket, fileFolder)).start();
+
         System.out.println("[Dstore] Sent JOIN message: JOIN " + port);
 
         ServerSocket serverSocket = new ServerSocket(port);
@@ -42,29 +44,28 @@ private static PrintWriter controllerOut;
  * @param fileFolder the directory to save received files in
  * @param cport the controller's port
  */
-    private static void handleClient(Socket socket,String fileFolder,int cport) {
+    private static void handleClient(Socket socket, String fileFolder, int cport) {
     try (
         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-        DataInputStream dataIn = new DataInputStream(socket.getInputStream());
-
+        PrintWriter out = new PrintWriter(socket.getOutputStream(), true)
     ) {
+        System.out.println("[Dstore]  Waiting for message...");
         String msg = in.readLine();
         System.out.println("[Dstore] Received: " + msg);
 
-        if (msg != null && msg.startsWith(Protocol.STORE_TOKEN)) {
+        if (msg.startsWith(Protocol.STORE_TOKEN)) {
             String[] parts = msg.split(" ");
             if (parts.length == 3) {
                 String filename = parts[1];
                 int filesize = Integer.parseInt(parts[2]);
 
                 System.out.println("[Dstore] Preparing to receive file: " + filename + " (" + filesize + " bytes)");
-
                 out.println(Protocol.ACK_TOKEN);
-                System.out.println("[Dstore] Sent: " +  Protocol.ACK_TOKEN );
-                
+                System.out.println("[Dstore] Sent: " + Protocol.ACK_TOKEN);
+
                 File file = new File(fileFolder, filename);
-                try (FileOutputStream fos = new FileOutputStream(file)) {
+                try (DataInputStream dataIn = new DataInputStream(socket.getInputStream());
+                     FileOutputStream fos = new FileOutputStream(file)) {
                     byte[] buffer = new byte[filesize];
                     dataIn.readFully(buffer);
                     fos.write(buffer);
@@ -73,46 +74,38 @@ private static PrintWriter controllerOut;
 
                 controllerOut.println(Protocol.STORE_ACK_TOKEN + " " + filename);
                 System.out.println("[Dstore] Sent STORE_ACK to controller for: " + filename);
-            
             }
-        }if (msg != null && msg.startsWith(Protocol.LOAD_DATA_TOKEN)) {
-    String[] parts = msg.split(" ");
-    if (parts.length == 2) {
-        String filename = parts[1];
-        File file = new File(fileFolder, filename);
 
-        if (file.exists()) {
-            System.out.println("[Dstore] Preparing to send file: " + filename);
+        } else if (msg.startsWith(Protocol.LOAD_DATA_TOKEN)) {
+            String[] parts = msg.split(" ");
+            if (parts.length == 2) {
+                String filename = parts[1];
+                File file = new File(fileFolder, filename);
 
-            // Send the file content to the client using OutputStream
-            try (BufferedOutputStream outData = new BufferedOutputStream(socket.getOutputStream());
-                 FileInputStream fis = new FileInputStream(file)) {
-
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-                while ((bytesRead = fis.read(buffer)) != -1) {
-                    outData.write(buffer, 0, bytesRead);
+                if (file.exists()) {
+                    System.out.println("[Dstore] Preparing to send file: " + filename);
+                    try (BufferedOutputStream outData = new BufferedOutputStream(socket.getOutputStream());
+                         FileInputStream fis = new FileInputStream(file)) {
+                        byte[] buffer = new byte[8192];
+                        int bytesRead;
+                        while ((bytesRead = fis.read(buffer)) != -1) {
+                            outData.write(buffer, 0, bytesRead);
+                        }
+                        outData.flush();
+                        System.out.println("[Dstore] File " + filename + " sent successfully");
+                    }
+                } else {
+                    System.out.println("[Dstore] File not found: " + filename + ". Closing socket.");
                 }
-                outData.flush();
-                System.out.println("[Dstore] File " + filename + " sent successfully");
-
-            } catch (IOException e) {
-                System.out.println("[Dstore] Error sending file: " + e.getMessage());
             }
 
-        } else {
-            // Per spec: if file does not exist, simply close the connection
-            System.out.println("[Dstore] File not found: " + filename + ". Closing socket.");
-            socket.close();
-        }
-    }
-}
-
+        } 
 
     } catch (Exception e) {
         System.out.println("[Dstore] Error handling client: " + e.getMessage());
     }
 }
+
 
 
 /**
@@ -142,6 +135,46 @@ private static boolean prepareFolder(String fileFolder) {
 
     System.out.println("[Dstore] Folder refreshed: " + fileFolder);
     return true;
+}
+
+
+/**
+ * handles commands from recieved by the controller for the remove operation
+ * @param socket socket connected to the Controller
+ * @param fileFolder the file locations in the directory
+ */
+private static void handleControllerCommands(Socket socket, String fileFolder) {
+    try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+        String msg;
+        while ((msg = in.readLine()) != null) {
+            System.out.println("[Dstore]  From Controller: " + msg);
+
+            if (msg.startsWith(Protocol.REMOVE_TOKEN)) {
+                String[] parts = msg.split(" ");
+                if (parts.length == 2) {
+                    String filename = parts[1];
+                    File file = new File(fileFolder, filename);
+
+                    if (file.exists()) {
+                        if (file.delete()) {
+                            System.out.println("[Dstore] File deleted: " + filename);
+                            controllerOut.println(Protocol.REMOVE_ACK_TOKEN + " " + filename);
+                            System.out.println("[Dstore] Sent REMOVE_ACK for: " + filename);
+                        } else {
+                            System.out.println("[Dstore] Failed to delete file: " + filename);
+                        }
+                    } else {
+                        controllerOut.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN + " " + filename);
+                        System.out.println("[Dstore] File not found, sent ERROR_FILE_DOES_NOT_EXIST for: " + filename);
+                    }
+                }
+            } else {
+                System.out.println("[Dstore] Unknown message from controller: " + msg);
+            }
+        }
+    } catch (IOException e) {
+        System.out.println("[Dstore] Controller connection lost: " + e.getMessage());
+    }
 }
 
 

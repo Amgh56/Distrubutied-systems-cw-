@@ -6,11 +6,13 @@ import java.util.concurrent.*;
 public class Controller {
 static Map<String, List<Integer>> fileToDstores = new ConcurrentHashMap<>();
 static Map<String, Set<Integer>> storeAcks = new ConcurrentHashMap<>();
+static Map<String, Set<Integer>> removeAcks = new ConcurrentHashMap<>();
 static Map<String, Socket> fileToClient = new ConcurrentHashMap<>();
 static Map<Socket, Integer> socketToDstorePort = new ConcurrentHashMap<>();
 enum FileStatus {
     STORE_IN_PROGRESS,
-    STORE_COMPLETE
+    STORE_COMPLETE,
+    REMOVE_IN_PROGRESS
 }
 static Map<String, FileStatus> fileStatus = new ConcurrentHashMap<>();
 static Map<String, Integer> fileSizes = new ConcurrentHashMap<>();
@@ -181,7 +183,9 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
             System.out.println("[Controller] Received from Dstore socket: " + msg);
             if (msg.startsWith(Protocol.STORE_ACK_TOKEN)) {
                 handleStoreAck(socket, msg, replicationFactor ); 
-            } else {
+            } else if (msg.startsWith(Protocol.REMOVE_ACK_TOKEN) || msg.startsWith(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN)) {
+                 handleRemoveAck(socket, msg, replicationFactor);
+         }    else {
                 System.out.println("[Controller] Unknown message from dstore socket: " + msg);
             }
         }
@@ -207,7 +211,7 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
 
         if (!msg.startsWith(Protocol.RELOAD_TOKEN)) {
             clientLoadHistory.remove(socket);
-         System.out.println("[Controller] 🔄 Cleared load retry history for client: " + socket);
+         System.out.println("[Controller]  Cleared load retry history for client: " + socket);
 
         }
 
@@ -280,7 +284,10 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
 
     } else if (msg.startsWith(Protocol.RELOAD_TOKEN)) {
     handleReloadRequest(socket, msg, out, dstorePorts, R);
+} else if (msg.startsWith(Protocol.REMOVE_TOKEN)) {
+    handleRemoveRequest(socket, msg, out, dstorePorts, R);
 }
+
 
 }
 
@@ -431,6 +438,152 @@ private static void handleReloadRequest(Socket socket, String msg, PrintWriter o
 
     out.println(Protocol.ERROR_LOAD_TOKEN);
     System.out.println("[Controller]  All Dstores failed for file: " + filename);
+}
+
+
+/**
+ * Handles the remove request from the client
+ * @param socket client socket sending request
+ * @param msg Remove message
+ * @param out the ouptut stream to respont to the client 
+ * @param dstorePorts the list of active ports
+ * @param R the replication factor 
+ */
+private static void handleRemoveRequest(Socket socket, String msg, PrintWriter out, List<Integer> dstorePorts, int R) {
+    String[] parts = msg.split(" ");
+    if (parts.length != 2) {
+        System.out.println("[Controller] Invalid REMOVE message: " + msg);
+        return;
+    }
+
+    String filename = parts[1];
+
+    if (dstorePorts.size() < R) {
+        out.println(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
+        System.out.println("[Controller] Not enough Dstores for REMOVE.");
+        return;
+    }
+
+    FileStatus status = fileStatus.get(filename);
+    if (status != FileStatus.STORE_COMPLETE || !fileToDstores.containsKey(filename)) {
+        out.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+        System.out.println("[Controller] File does not exist or not in correct status: " + filename);
+        return;
+    }
+
+    fileStatus.put(filename, FileStatus.REMOVE_IN_PROGRESS);
+    removeAcks.putIfAbsent(filename, ConcurrentHashMap.newKeySet());
+    fileToClient.put(filename, socket);
+
+    List<Integer> dstoresWithFile = fileToDstores.get(filename);
+    for (int port : dstoresWithFile) {
+        try {
+            Socket dstoreSocket = null;
+            for (Map.Entry<Socket, Integer> entry : socketToDstorePort.entrySet()) {
+                if (entry.getValue() == port) {
+                    dstoreSocket = entry.getKey();
+                    break;
+                }
+            }
+
+            if (dstoreSocket != null && !dstoreSocket.isClosed()) {
+                PrintWriter dstoreOut = new PrintWriter(dstoreSocket.getOutputStream(), true);
+                dstoreOut.println(Protocol.REMOVE_TOKEN + " " + filename);
+                dstoreOut.flush();
+                System.out.println("[Controller] Sent REMOVE " + filename + " to Dstore " + port);
+            }
+
+        } catch (IOException e) {
+            System.out.println("[Controller] Failed to send REMOVE to Dstore " + port + ": " + e.getMessage());
+        }
+    }
+
+    new Thread(() -> {
+        try {
+            Thread.sleep(timeout);
+            Set<Integer> acks = removeAcks.get(filename);
+            FileStatus currentStatus = fileStatus.get(filename);
+
+            if ((acks == null || acks.size() < R) && currentStatus == FileStatus.REMOVE_IN_PROGRESS) {
+                System.out.println("[Controller] Timeout waiting for REMOVE_ACKs for: " + filename);
+            }
+        } catch (InterruptedException e) {
+            System.out.println("[Controller] Timeout thread interrupted for REMOVE: " + filename);
+        }
+    }).start();
+}
+
+
+/**
+ * Handles the remove ack recieved from the Dstore 
+ * and sends the Remove complete to the client 
+ * @param socket connected to the dstore sending the ack
+ * @param msg Remove_ack message recieved 
+ * @param R replication factor 
+ */
+private static void handleRemoveAck(Socket socket, String msg, int R) {
+    try {
+        System.out.println("[Controller] Received: " + msg);
+
+        String[] parts = msg.split(" ");
+        if (parts.length != 2) {
+            System.out.println("[Controller] Malformed REMOVE_ACK or ERROR_FILE_DOES_NOT_EXIST: " + msg);
+            return;
+        }
+
+        String filename = parts[1];
+        Integer dstorePort = socketToDstorePort.get(socket);
+        if (dstorePort == null) {
+            System.out.println("[Controller] Unknown socket for REMOVE_ACK");
+            return;
+        }
+
+        List<Integer> assignedDstores = fileToDstores.get(filename);
+        if (assignedDstores == null || !assignedDstores.contains(dstorePort)) {
+            System.out.println("[Controller] Dstore " + dstorePort + " not assigned for file: " + filename);
+            return;
+        }
+
+         synchronized (filename.intern()) {
+        removeAcks.computeIfAbsent(filename, k -> ConcurrentHashMap.newKeySet()).add(dstorePort);
+
+        System.out.println("[Controller] Added REMOVE_ACK from Dstore " + dstorePort + " for file " + filename);
+
+        Set<Integer> acks = removeAcks.get(filename);
+        if (acks == null) {
+            System.out.println("[Controller] Warning: Received duplicate REMOVE_ACK after completion for file: " + filename);
+            return;
+        }
+        int ackCount = acks.size();
+
+        System.out.println("[Controller] Ack count for REMOVE " + filename + ": " + ackCount + " / " + R);
+
+        if (ackCount >= R) {
+            System.out.println("[Controller] All REMOVE_ACKs received for: " + filename);
+
+            // Remove file from all relevant maps
+            fileStatus.remove(filename);
+            fileToDstores.remove(filename);
+            fileSizes.remove(filename);
+            removeAcks.remove(filename);
+
+            // Send REMOVE_COMPLETE to client
+            Socket clientSocket = fileToClient.get(filename);
+            if (clientSocket != null && !clientSocket.isClosed()) {
+                PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
+                clientOut.println(Protocol.REMOVE_COMPLETE_TOKEN);
+                clientOut.flush();
+                System.out.println("[Controller] Sent REMOVE_COMPLETE to client for: " + filename);
+            }
+
+            fileToClient.remove(filename); // cleanup
+        }
+    }
+
+    } catch (Exception e) {
+        System.out.println("[Controller] Error handling REMOVE_ACK: " + e.getMessage());
+        e.printStackTrace();
+    }
 }
 
 
