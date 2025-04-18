@@ -17,9 +17,17 @@ enum FileStatus {
 static Map<String, FileStatus> fileStatus = new ConcurrentHashMap<>();
 static Map<String, Integer> fileSizes = new ConcurrentHashMap<>();
 static Map<Socket, Map<String, Set<Integer>>> clientLoadHistory = new ConcurrentHashMap<>();
-
+static volatile boolean rebalanceRunning = false;
+static ScheduledExecutorService rebalanceScheduler = Executors.newSingleThreadScheduledExecutor();
 static int replicationFactor;
 static int timeout;
+static Map<Integer, Set<String>> dstoreFiles = new ConcurrentHashMap<>();
+static CountDownLatch listLatch;
+static Map<Integer, List<String>> filesToRemove = new HashMap<>();
+static Map<Integer, Map<String, List<Integer>>> filesToSend = new HashMap<>();
+static Queue<Runnable> pendingClientRequests = new ConcurrentLinkedQueue<>();
+static Queue<Runnable> pendingJoinRequests = new ConcurrentLinkedQueue<>();
+static Set<Integer> rebalanceAcks = ConcurrentHashMap.newKeySet();
 
 
     public static void main(String[] args) throws Exception {
@@ -31,25 +39,64 @@ static int timeout;
     ServerSocket serverSocket = new ServerSocket(cport);
     List<Integer> dstorePorts = new ArrayList<>();
     System.out.println("[Controller] Listening on port " + cport);
+    startRebalanceThread(rebalancePeriod);
+        System.out.println("[Controller] rebalance started " );
+
+
 
     //handle conections recieved
     while (true) {
         Socket socket = serverSocket.accept();
-        System.out.println("[Controller] Connection accepted");
 
-        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        String msg = in.readLine();
-        System.out.println("[Controller] Received: " + msg);
+       if (rebalanceRunning) {
+         Socket finalSocket = socket;
+        new Thread(() -> {
+         try {
+            BufferedReader in = new BufferedReader(new InputStreamReader(finalSocket.getInputStream()));
+            String msg = in.readLine();
 
-        if (msg != null && msg.startsWith(Protocol.JOIN_TOKEN)) {
-            handleJoin(msg, socket, dstorePorts);
-        } else if (msg != null) {
-            new Thread(() -> handleClient(socket, dstorePorts, replicationFactor, msg)).start();
-        }else {
-            System.out.println("[Controller] Error things did not go will : " + msg);
-            socket.close();
+            if (msg != null && msg.startsWith(Protocol.JOIN_TOKEN)) {
+                pendingJoinRequests.add(() -> handleJoin(msg, finalSocket, dstorePorts));
+                System.out.println("[Controller] Queued JOIN during rebalance");
+            } else {
+                pendingClientRequests.add(() -> handleClient(finalSocket, dstorePorts, replicationFactor, msg));
+                System.out.println("[Controller] Queued client request during rebalance");
+            }
+        } catch (IOException e) {
+            System.out.println("[Controller] Error reading from socket during rebalance: " + e.getMessage());
         }
+    }).start();
+        } else {
+            // Normal processing
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            String msg = in.readLine();
+
+            if (msg != null && msg.startsWith(Protocol.JOIN_TOKEN)) {
+                handleJoin(msg, socket, dstorePorts);
+            } else if (msg != null) {
+                new Thread(() -> handleClient(socket, dstorePorts, replicationFactor, msg)).start();
+            } else {
+                socket.close();
+            }
+        }
+
     }
+}
+
+
+
+/**
+ * Marks rebalance as completed and start working with the queued requests
+ */
+private static void finishRebalance() {
+    rebalanceRunning = false;
+    while (!pendingJoinRequests.isEmpty()) {
+        pendingJoinRequests.poll().run();
+    }
+    while (!pendingClientRequests.isEmpty()) {
+        pendingClientRequests.poll().run();
+    }
+    System.out.println("[Controller] Finished rebalance. Processed queued requests.");
 }
 
 
@@ -68,6 +115,11 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
         new Thread(() -> listenToDstore(socket)).start();
         System.out.println("[Controller] Dstore joined on port: " + port);
         System.out.println("[Controller] Total Dstores joined: " + dstorePorts.size());
+
+        if (dstorePorts.size() >= replicationFactor && !rebalanceRunning) {
+            triggerRebalance("Join");
+        }
+
     } else {
         System.out.println("[Controller] Invalid JOIN message: " + msg);
     }
@@ -170,6 +222,21 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
 }
 
 
+/**
+ * handles the rebalance complete sent via dstore
+ * @param socket dstore socket that sent the ack
+ */
+private static void handleRebalanceAck(Socket socket) {
+    Integer port = socketToDstorePort.get(socket);
+    if (port == null) {
+        System.out.println("[Controller] Received REBALANCE_COMPLETE from unknown Dstore");
+        return;
+    }
+
+    rebalanceAcks.add(port);
+    System.out.println("[Controller] Received REBALANCE_COMPLETE from Dstore " + port);
+}
+
 
     /**
      *  this method handle store ack recieved 
@@ -185,11 +252,17 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
                 handleStoreAck(socket, msg, replicationFactor ); 
             } else if (msg.startsWith(Protocol.REMOVE_ACK_TOKEN) || msg.startsWith(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN)) {
                  handleRemoveAck(socket, msg, replicationFactor);
-         }    else {
+             } else if (msg.startsWith(Protocol.LIST_TOKEN)) {
+                 handleListResponse(socket, msg);
+             }else if (msg.startsWith(Protocol.REBALANCE_COMPLETE_TOKEN)) {
+                handleRebalanceAck(socket);
+            }
+            else {
                 System.out.println("[Controller] Unknown message from dstore socket: " + msg);
             }
         }
-    } catch (IOException e) {
+        }
+     catch (IOException e) {
         System.out.println("[Controller] Connection to Dstore lost: " + e.getMessage());
     }
 }
@@ -224,7 +297,6 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
             fileSizes.put(filename, filesize);
 
           
-
             if (dstorePorts.size() < R) {
                 out.println(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
                 System.out.println("Warning " + Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
@@ -305,12 +377,20 @@ private static void handleListRequest(PrintWriter out, List<Integer> dstorePorts
         return;
     }
 
-    StringBuilder response = new StringBuilder(Protocol.LIST_TOKEN);
-    for (Map.Entry<String, FileStatus> entry : fileStatus.entrySet()) {
-        if (entry.getValue() == FileStatus.STORE_COMPLETE) {
-            response.append(" ").append(entry.getKey());
-        }
+   List<String> sortedFiles = new ArrayList<>();
+
+for (Map.Entry<String, FileStatus> entry : fileStatus.entrySet()) {
+    if (entry.getValue() == FileStatus.STORE_COMPLETE) {
+        sortedFiles.add(entry.getKey());
     }
+}
+
+Collections.sort(sortedFiles); // Sort alphabetically
+
+StringBuilder response = new StringBuilder(Protocol.LIST_TOKEN);
+for (String filename : sortedFiles) {
+    response.append(" ").append(filename);
+}
     out.println(response.toString());
     System.out.println("[Controller]  Sent LIST response to client: " + response);
 }
@@ -587,6 +667,324 @@ private static void handleRemoveAck(Socket socket, String msg, int R) {
 }
 
 
+/**
+ * Starts the background thread for the Rebalance operation
+ * @param rebalancePeriod the time interval in seconds
+ */
+private static void startRebalanceThread(int rebalancePeriod) {
+    rebalanceScheduler.scheduleAtFixedRate(() -> {
+        if (rebalanceRunning) {
+            System.out.println("[Controller] Rebalance already running — skipping this period.");
+            return;
+        }
+        triggerRebalance("Periodic");
+    }, rebalancePeriod, rebalancePeriod, TimeUnit.SECONDS);
+}
+
+
+/**
+ * This method triggers a rebalance to ensure files are distirbuted correctly through dstores
+ * @param reason of the trigger either periodically or if a new JOIN triggered
+ */
+private static void triggerRebalance(String reason) {
+    if (!canTriggerRebalance(reason)) return;
+
+    rebalanceRunning = true;
+    System.out.println("[Controller]  Rebalance triggered: " + reason);
+
+    requestDstoreFileLists();
+
+    new Thread(() -> {
+        try {
+            waitForListResponses();
+            Map<String, Set<Integer>> fileToActualDstores = computeFileToActualDstores();
+            computeFilesToSendAndRemove(fileToActualDstores);
+            balanceFileDistribution(fileToActualDstores);
+            sendRebalanceInstructions();
+            waitForRebalanceAcks();
+            cleanupIndexIfNeeded(fileToActualDstores);
+        } catch (InterruptedException e) {
+            System.out.println("[Controller] Rebalance thread interrupted.");
+        } finally {
+            rebalanceRunning = false;
+            finishRebalance();
+        }
+    }).start();
+}
+
+/**
+ * @param reason of the trigger either periodically or if a new JOIN triggered
+ * @return true if a trigger is allowed
+ */
+private static boolean canTriggerRebalance(String reason) {
+    if (rebalanceRunning) {
+        System.out.println("[Controller] Rebalance already running. Skipping: " + reason);
+        return false;
+    }
+    if (socketToDstorePort.size() < replicationFactor) {
+        System.out.println("[Controller] Not enough Dstores to trigger rebalance (" + socketToDstorePort.size() + "/" + replicationFactor + ")");
+        return false;
+    }
+    for (FileStatus status : fileStatus.values()) {
+        if (status == FileStatus.STORE_IN_PROGRESS || status == FileStatus.REMOVE_IN_PROGRESS) {
+            System.out.println("[Controller] Rebalance postponed due to pending STORE or REMOVE");
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * this method waits for all dstore to respond to the LIST request 
+ */
+private static void waitForListResponses() throws InterruptedException {
+    if (!listLatch.await(timeout, TimeUnit.MILLISECONDS)) {
+        System.out.println("[Controller] Timeout waiting for LIST responses.");
+    } else {
+        System.out.println("[Controller] All LIST responses received.");
+    }
+}
+
+/**
+ * this method builds a map based on the files inside eact dstore 
+ */
+private static Map<String, Set<Integer>> computeFileToActualDstores() {
+    Map<String, Set<Integer>> result = new TreeMap<>();
+    for (Map.Entry<Integer, Set<String>> entry : dstoreFiles.entrySet()) {
+        for (String filename : entry.getValue()) {
+            result.computeIfAbsent(filename, k -> new TreeSet<>()).add(entry.getKey());
+        }
+    }
+    System.out.println("[Rebalance] Built fileToActualDstores: " + result);
+    return result;
+}
+
+
+/**
+ * This method is responsible about computing which files need to be removed or sent to anotehr dstore 
+ * @param fileToActualDstores a map of file names and a set of the dstore storing them 
+ */
+private static void computeFilesToSendAndRemove(Map<String, Set<Integer>> fileToActualDstores) {
+    filesToSend.clear();
+    filesToRemove.clear();
+
+    for (Map.Entry<String, Set<Integer>> entry : fileToActualDstores.entrySet()) {
+        String filename = entry.getKey();
+        Set<Integer> currentDstores = new HashSet<>(entry.getValue());
+
+        if (!fileStatus.containsKey(filename)) {
+            for (int port : currentDstores) {
+                filesToRemove.computeIfAbsent(port, k -> new ArrayList<>()).add(filename);
+            }
+            continue;
+        }
+
+        if (currentDstores.size() < replicationFactor) {
+            Set<Integer> neededDstores = new HashSet<>(socketToDstorePort.values());
+            neededDstores.removeAll(currentDstores);
+            Iterator<Integer> iter = neededDstores.iterator();
+
+            while (currentDstores.size() < replicationFactor && iter.hasNext()) {
+                int newTarget = iter.next();
+                int source = currentDstores.iterator().next();
+
+                filesToSend.computeIfAbsent(source, k -> new TreeMap<>())
+                    .computeIfAbsent(filename, k -> new ArrayList<>()).add(newTarget);
+
+                currentDstores.add(newTarget);
+            }
+        }
+
+        if (currentDstores.size() > replicationFactor) {
+            List<Integer> sortedDstores = new ArrayList<>(currentDstores);
+            Collections.sort(sortedDstores);
+            while (sortedDstores.size() > replicationFactor) {
+                int excess = sortedDstores.remove(sortedDstores.size() - 1);
+                filesToRemove.computeIfAbsent(excess, k -> new ArrayList<>()).add(filename);
+            }
+        }
+    }
+
+    for (Map.Entry<Integer, Set<String>> entry : dstoreFiles.entrySet()) {
+        for (String file : entry.getValue()) {
+            if (!fileToActualDstores.containsKey(file)) {
+                filesToRemove.computeIfAbsent(entry.getKey(), k -> new ArrayList<>()).add(file);
+            }
+        }
+    }
+
+    System.out.println("[Rebalance] Files to remove: " + filesToRemove);
+    System.out.println("[Rebalance] Files to send: " + filesToSend);
+}
+
+
+/**
+ * balances the each dstore to ensure each dstore have a fair number of files stored
+ * @param fileToActualDstores a map of file names and a set of the dstore storing them 
+ */
+private static void balanceFileDistribution(Map<String, Set<Integer>> fileToActualDstores) {
+    int F = fileStatus.size();
+    int N = socketToDstorePort.size();
+    int R = replicationFactor;
+    int totalCopies = F * R;
+    int targetMin = totalCopies / N;
+    int targetMax = (int) Math.ceil((double) totalCopies / N);
+    System.out.println("[Rebalance] Target files per Dstore: min = " + targetMin + ", max = " + targetMax);
+
+    Map<Integer, Integer> dstoreToFileCount = new HashMap<>();
+    Map<Integer, Set<String>> dstoreToFiles = new HashMap<>();
+
+    for (Map.Entry<Integer, Set<String>> entry : dstoreFiles.entrySet()) {
+        dstoreToFileCount.put(entry.getKey(), entry.getValue().size());
+        dstoreToFiles.put(entry.getKey(), new HashSet<>(entry.getValue()));
+    }
+
+    PriorityQueue<Integer> overloaded = new PriorityQueue<>((a, b) -> dstoreToFileCount.get(b) - dstoreToFileCount.get(a));
+    PriorityQueue<Integer> underloaded = new PriorityQueue<>((a, b) -> dstoreToFileCount.get(a) - dstoreToFileCount.get(b));
+
+    for (int dstore : dstoreToFileCount.keySet()) {
+        int count = dstoreToFileCount.get(dstore);
+        if (count > targetMax) overloaded.add(dstore);
+        else if (count < targetMin) underloaded.add(dstore);
+    }
+
+    while (!overloaded.isEmpty() && !underloaded.isEmpty()) {
+        int from = overloaded.poll();
+        int to = underloaded.poll();
+
+        for (String file : dstoreToFiles.get(from)) {
+            Set<Integer> holders = fileToActualDstores.get(file);
+            if (holders == null || holders.contains(to)) continue;
+
+            filesToSend.computeIfAbsent(from, k -> new TreeMap<>())
+                .computeIfAbsent(file, k -> new ArrayList<>()).add(to);
+
+            filesToRemove.computeIfAbsent(from, k -> new ArrayList<>()).add(file);
+            holders.add(to);
+            dstoreToFileCount.put(from, dstoreToFileCount.get(from) - 1);
+            dstoreToFileCount.put(to, dstoreToFileCount.get(to) + 1);
+            dstoreToFiles.get(to).add(file);
+            dstoreToFiles.get(from).remove(file);
+            break;
+        }
+
+        if (dstoreToFileCount.get(from) > targetMax) overloaded.add(from);
+        if (dstoreToFileCount.get(to) < targetMin) underloaded.add(to);
+    }
+}
+
+/**
+ * this method sends rebalance commands to each dstore
+ */
+private static void sendRebalanceInstructions() {
+    for (int dstore : socketToDstorePort.values()) {
+        StringBuilder msg = new StringBuilder(Protocol.REBALANCE_TOKEN);
+
+        Map<String, List<Integer>> toSend = filesToSend.getOrDefault(dstore, new TreeMap<>());
+        msg.append(" ").append(toSend.size());
+        for (Map.Entry<String, List<Integer>> sendEntry : toSend.entrySet()) {
+            msg.append(" ").append(sendEntry.getKey()).append(" ").append(sendEntry.getValue().size());
+            for (int target : sendEntry.getValue()) msg.append(" ").append(target);
+        }
+
+        List<String> toRemove = filesToRemove.getOrDefault(dstore, new ArrayList<>());
+        msg.append(" ").append(toRemove.size());
+        for (String file : toRemove) msg.append(" ").append(file);
+
+        try {
+            for (Map.Entry<Socket, Integer> entry : socketToDstorePort.entrySet()) {
+                if (entry.getValue() == dstore) {
+                    PrintWriter out = new PrintWriter(entry.getKey().getOutputStream(), true);
+                    out.println(msg);
+                    System.out.println("[Controller] Sent REBALANCE to Dstore " + dstore + ": " + msg);
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            System.out.println("[Controller] Failed to send REBALANCE to Dstore " + dstore + ": " + e.getMessage());
+        }
+    }
+}
+
+
+/**
+ * this method waits for rebalance complete ack until it recieved it all of time out.
+ */
+private static void waitForRebalanceAcks() {
+    rebalanceAcks.clear();
+    System.out.println("[Controller] Waiting for REBALANCE_COMPLETE from all Dstores...");
+    long start = System.currentTimeMillis();
+    while (rebalanceAcks.size() < socketToDstorePort.size()) {
+        if (System.currentTimeMillis() - start > timeout) {
+            System.out.println("[Controller] Timeout waiting for REBALANCE_COMPLETEs.");
+            break;
+        }
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            break;
+        }
+    }
+}
+
+/**
+ * removes a file from a dstore if not found in the controller index.
+ */
+private static void cleanupIndexIfNeeded(Map<String, Set<Integer>> fileToActualDstores) {
+    for (String file : new ArrayList<>(fileStatus.keySet())) {
+        if (!fileToActualDstores.containsKey(file)) {
+            System.out.println("[Rebalance]  File " + file + " is in the index but not found on any Dstore. It should be removed from the index.");
+            fileStatus.remove(file);
+            fileToDstores.remove(file);
+            fileSizes.remove(file);
+        }
+    }
+}
+
+
+
+/**
+ * Sends a List command to all of the connected dstores.
+ */
+    private static void requestDstoreFileLists() {
+    listLatch = new CountDownLatch(socketToDstorePort.size());
+    dstoreFiles.clear();
+
+    for (Socket socket : socketToDstorePort.keySet()) {
+        try {
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            out.println(Protocol.LIST_TOKEN);
+            System.out.println("[Controller] Sent LIST to Dstore on port " + socketToDstorePort.get(socket));
+        } catch (IOException e) {
+            System.out.println("[Controller] Failed to send LIST to Dstore: " + e.getMessage());
+        }
+    }
+}
+
+
+/**
+ * Handles a List response recieved from the dstore by parsing the filenames
+ * @param socket from where the list operation where recieved
+ * @param msg the full list message recieved.
+ */
+private static void handleListResponse(Socket socket, String msg) {
+    Integer port = socketToDstorePort.get(socket);
+    if (port == null) {
+        System.out.println("[Controller] LIST from unknown socket");
+        return;
+    }
+
+    String[] parts = msg.split(" ");
+    Set<String> files = new HashSet<>();
+    for (int i = 1; i < parts.length; i++) {
+        files.add(parts[i]);
+    }
+
+    dstoreFiles.put(port, files);
+    System.out.println("[Controller] LIST from Dstore " + port + ": " + files);
+
+    listLatch.countDown();  
+}
 
 
 }
