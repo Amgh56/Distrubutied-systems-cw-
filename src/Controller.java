@@ -28,6 +28,8 @@ static Map<Integer, Map<String, List<Integer>>> filesToSend = new HashMap<>();
 static Queue<Runnable> pendingClientRequests = new ConcurrentLinkedQueue<>();
 static Queue<Runnable> pendingJoinRequests = new ConcurrentLinkedQueue<>();
 static Set<Integer> rebalanceAcks = ConcurrentHashMap.newKeySet();
+static List<Integer> dstorePorts = new CopyOnWriteArrayList<>();
+
 
 
     public static void main(String[] args) throws Exception {
@@ -37,51 +39,58 @@ static Set<Integer> rebalanceAcks = ConcurrentHashMap.newKeySet();
     int rebalancePeriod = Integer.parseInt(args[3]);
     //This socket except accepts connections from both dstore and client.
     ServerSocket serverSocket = new ServerSocket(cport);
-    List<Integer> dstorePorts = new ArrayList<>();
     System.out.println("[Controller] Listening on port " + cport);
     startRebalanceThread(rebalancePeriod);
         System.out.println("[Controller] rebalance started " );
 
 
 
-    //handle conections recieved
-    while (true) {
-        Socket socket = serverSocket.accept();
-
-       if (rebalanceRunning) {
-         Socket finalSocket = socket;
-        new Thread(() -> {
-         try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(finalSocket.getInputStream()));
+   while (true) {
+    Socket socket = serverSocket.accept();
+    new Thread(() -> {
+        try {
+            BufferedReader in = new BufferedReader(
+                new InputStreamReader(socket.getInputStream()));
             String msg = in.readLine();
+            if (msg == null) {
+                socket.close();
+                return;
+            }
 
-            if (msg != null && msg.startsWith(Protocol.JOIN_TOKEN)) {
-                pendingJoinRequests.add(() -> handleJoin(msg, finalSocket, dstorePorts));
-                System.out.println("[Controller] Queued JOIN during rebalance");
+            // JOIN: queue during rebalance, otherwise handle immediately
+            if (msg.startsWith(Protocol.JOIN_TOKEN)) {
+                if (rebalanceRunning) {
+                    pendingJoinRequests.add(() -> 
+                        handleJoin(msg, socket, dstorePorts));
+                    System.out.println("[Controller] Queued JOIN during rebalance");
+                } else {
+                    handleJoin(msg, socket, dstorePorts);
+                }
+
+            // LIST: always serve immediately
+            } else if (msg.startsWith(Protocol.LIST_TOKEN) || msg.startsWith(Protocol.LOAD_TOKEN) || msg.startsWith(Protocol.RELOAD_TOKEN)) {
+                handleClient(socket, dstorePorts, replicationFactor, msg);
+              System.out.println("[Controller] Served READ (“" + msg.split(" ")[0] + "”) during rebalance");
+
+            // STORE/LOAD/REMOVE: queue during rebalance, otherwise handle immediately
             } else {
-                pendingClientRequests.add(() -> handleClient(finalSocket, dstorePorts, replicationFactor, msg));
-                System.out.println("[Controller] Queued client request during rebalance");
+                if (rebalanceRunning) {
+                    pendingClientRequests.add(() -> 
+                        handleClient(socket, dstorePorts, replicationFactor, msg));
+                    System.out.println("[Controller] Queued client request during rebalance");
+                } else {
+                    handleClient(socket, dstorePorts, replicationFactor, msg);
+                }
             }
         } catch (IOException e) {
-            System.out.println("[Controller] Error reading from socket during rebalance: " + e.getMessage());
+            System.out.println("[Controller] Error reading initial message: " 
+                               + e.getMessage());
         }
     }).start();
-        } else {
-            // Normal processing
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            String msg = in.readLine();
-
-            if (msg != null && msg.startsWith(Protocol.JOIN_TOKEN)) {
-                handleJoin(msg, socket, dstorePorts);
-            } else if (msg != null) {
-                new Thread(() -> handleClient(socket, dstorePorts, replicationFactor, msg)).start();
-            } else {
-                socket.close();
-            }
-        }
+}
 
     }
-}
+
 
 
 
@@ -133,24 +142,25 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
  * @param dstorePorts list of all active dstore ports.
  * @param message first message received by the client 
  */
-    private static void handleClient(Socket socket, List<Integer> dstorePorts, int R, String message) {
-    try{
-        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-        String msg = message;
-        System.out.println("[Controller] Received from client (initial): " + msg);
-        handleMessageFromClient(socket,msg, out, dstorePorts, R);
+ private static void handleClient(Socket socket, List<Integer> dstorePorts, int R, String initial) {
+     new Thread(() -> {
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
 
-        while ((msg = in.readLine()) != null) {
-        System.out.println("[Controller] Received from client: " + msg);
-        handleMessageFromClient(socket, msg, out, dstorePorts, R);
+            System.out.println("[Controller] Received from client: " + initial);
+            handleMessageFromClient(socket, initial, out, dstorePorts, R);
+
+            // now loop on every other incoming line, *on the same thread*
+            String msg;
+            while ((msg = in.readLine()) != null) {
+                System.out.println("[Controller] Received from client: " + msg);
+                handleMessageFromClient(socket, msg, out, dstorePorts, R);
+            }
+
+        } catch (IOException e) {
+            System.out.println("[Controller] Client handler error: " + e.getMessage());
         }
-
-        }catch (Exception e) {
-        System.out.println("[Controller] Client error: " + e.getMessage());
-
-     }
-     
+    }).start();
 }
     
 
@@ -210,7 +220,6 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
                 System.out.println("[Controller] No valid client socket for file: " + filename);
             }
 
-            // Clean up
             fileToClient.remove(filename);
             storeAcks.remove(filename);
         }
@@ -261,9 +270,23 @@ private static void handleRebalanceAck(Socket socket) {
                 System.out.println("[Controller] Unknown message from dstore socket: " + msg);
             }
         }
+        System.out.println("[Controller] Dstore socket closed by peer");
+        removeDeadDstore(socket);
         }
      catch (IOException e) {
         System.out.println("[Controller] Connection to Dstore lost: " + e.getMessage());
+    }
+}
+
+private static void removeDeadDstore(Socket socket) {
+    Integer port = socketToDstorePort.remove(socket);
+    if (port != null) {
+      dstorePorts.remove(port);
+      // drop it out of every replica list
+      for (List<Integer> replicas : fileToDstores.values()) {
+        replicas.remove((Integer)port);
+      }
+      System.out.println("[Controller] Dstore on port " + port + " removed from replica sets");
     }
 }
 
@@ -312,8 +335,10 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
             fileStatus.put(filename, FileStatus.STORE_IN_PROGRESS);
             fileToClient.put(filename, socket);
 
-            List<Integer> selectedDstores = dstorePorts.subList(0, R);
+            // when you choose your R replicas, make a fresh copy:
+            List<Integer> selectedDstores = new ArrayList<>(dstorePorts.subList(0, R));
             fileToDstores.put(filename, selectedDstores);
+
 
             StringBuilder response = new StringBuilder(Protocol.STORE_TO_TOKEN);
             for (int port : selectedDstores) {
@@ -326,7 +351,6 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
         } catch (IOException e) {
             System.out.println("[Controller] Failed to respond to client: " + e.getMessage());
         }
-            // out.println(response.toString());
             System.out.println("[Controller] Sent to client: " + response);
 
             new Thread(() -> {
@@ -385,7 +409,7 @@ for (Map.Entry<String, FileStatus> entry : fileStatus.entrySet()) {
     }
 }
 
-Collections.sort(sortedFiles); // Sort alphabetically
+Collections.sort(sortedFiles); 
 
 StringBuilder response = new StringBuilder(Protocol.LIST_TOKEN);
 for (String filename : sortedFiles) {
@@ -449,8 +473,10 @@ private static void handleLoadRequest(Socket socket,String msg, PrintWriter out,
             return;
         }
 
-    // Choose a Dstore (first one for now)
-    int selectedPort = dstoresWithFile.get(0);
+   List<Integer> candidates = new ArrayList<>(fileToDstores.get(filename));
+Collections.shuffle(candidates, ThreadLocalRandom.current());
+int selectedPort = candidates.get(0);  // now this is thread‐safe & stable
+
 
     clientLoadHistory
         .computeIfAbsent(socket, k -> new ConcurrentHashMap<>())
@@ -641,13 +667,11 @@ private static void handleRemoveAck(Socket socket, String msg, int R) {
         if (ackCount >= R) {
             System.out.println("[Controller] All REMOVE_ACKs received for: " + filename);
 
-            // Remove file from all relevant maps
             fileStatus.remove(filename);
             fileToDstores.remove(filename);
             fileSizes.remove(filename);
             removeAcks.remove(filename);
 
-            // Send REMOVE_COMPLETE to client
             Socket clientSocket = fileToClient.get(filename);
             if (clientSocket != null && !clientSocket.isClosed()) {
                 PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
@@ -656,7 +680,7 @@ private static void handleRemoveAck(Socket socket, String msg, int R) {
                 System.out.println("[Controller] Sent REMOVE_COMPLETE to client for: " + filename);
             }
 
-            fileToClient.remove(filename); // cleanup
+            fileToClient.remove(filename); 
         }
     }
 
@@ -988,4 +1012,3 @@ private static void handleListResponse(Socket socket, String msg) {
 
 
 }
-    

@@ -66,6 +66,8 @@ private static PrintWriter controllerOut;
                 int filesize = Integer.parseInt(parts[2]);
 
                 System.out.println("[Dstore] Preparing to receive file: " + filename + " (" + filesize + " bytes)");
+                        
+
                 out.println(Protocol.ACK_TOKEN);
                 System.out.println("[Dstore] Sent: " + Protocol.ACK_TOKEN);
 
