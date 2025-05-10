@@ -282,13 +282,16 @@ private static void removeDeadDstore(Socket socket) {
     Integer port = socketToDstorePort.remove(socket);
     if (port != null) {
       dstorePorts.remove(port);
-      // drop it out of every replica list
       for (List<Integer> replicas : fileToDstores.values()) {
-        replicas.remove((Integer)port);
+        replicas.remove(port);
       }
       System.out.println("[Controller] Dstore on port " + port + " removed from replica sets");
+      if (!rebalanceRunning && socketToDstorePort.size() >= replicationFactor) {
+          triggerRebalance("Dstore failure");
+      }
     }
 }
+
 
 
 /**
@@ -726,7 +729,6 @@ private static void triggerRebalance(String reason) {
             balanceFileDistribution(fileToActualDstores);
             sendRebalanceInstructions();
             waitForRebalanceAcks();
-            cleanupIndexIfNeeded(fileToActualDstores);
         } catch (InterruptedException e) {
             System.out.println("[Controller] Rebalance thread interrupted.");
         } finally {
