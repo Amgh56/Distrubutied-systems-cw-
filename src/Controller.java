@@ -57,7 +57,6 @@ static List<Integer> dstorePorts = new CopyOnWriteArrayList<>();
                 return;
             }
 
-            // JOIN: queue during rebalance, otherwise handle immediately
             if (msg.startsWith(Protocol.JOIN_TOKEN)) {
                 if (rebalanceRunning) {
                     pendingJoinRequests.add(() -> 
@@ -67,12 +66,10 @@ static List<Integer> dstorePorts = new CopyOnWriteArrayList<>();
                     handleJoin(msg, socket, dstorePorts);
                 }
 
-            // LIST: always serve immediately
             } else if (msg.startsWith(Protocol.LIST_TOKEN) || msg.startsWith(Protocol.LOAD_TOKEN) || msg.startsWith(Protocol.RELOAD_TOKEN)) {
                 handleClient(socket, dstorePorts, replicationFactor, msg);
               System.out.println("[Controller] Served READ (“" + msg.split(" ")[0] + "”) during rebalance");
 
-            // STORE/LOAD/REMOVE: queue during rebalance, otherwise handle immediately
             } else {
                 if (rebalanceRunning) {
                     pendingClientRequests.add(() -> 
@@ -150,7 +147,6 @@ private static void handleJoin(String msg, Socket socket, List<Integer> dstorePo
             System.out.println("[Controller] Received from client: " + initial);
             handleMessageFromClient(socket, initial, out, dstorePorts, R);
 
-            // now loop on every other incoming line, *on the same thread*
             String msg;
             while ((msg = in.readLine()) != null) {
                 System.out.println("[Controller] Received from client: " + msg);
@@ -286,11 +282,9 @@ private static void removeDeadDstore(Socket socket) {
         replicas.remove(port);
       }
       System.out.println("[Controller] Dstore on port " + port + " removed from replica sets");
-      if (!rebalanceRunning && socketToDstorePort.size() >= replicationFactor) {
-          triggerRebalance("Dstore failure");
-      }
     }
 }
+
 
 
 
@@ -338,7 +332,6 @@ private static void handleMessageFromClient(Socket socket, String msg, PrintWrit
             fileStatus.put(filename, FileStatus.STORE_IN_PROGRESS);
             fileToClient.put(filename, socket);
 
-            // when you choose your R replicas, make a fresh copy:
             List<Integer> selectedDstores = new ArrayList<>(dstorePorts.subList(0, R));
             fileToDstores.put(filename, selectedDstores);
 
@@ -729,6 +722,9 @@ private static void triggerRebalance(String reason) {
             balanceFileDistribution(fileToActualDstores);
             sendRebalanceInstructions();
             waitForRebalanceAcks();
+            if ("Periodic".equals(reason)) {
+                cleanupIndexIfNeeded(fileToActualDstores);
+            }           
         } catch (InterruptedException e) {
             System.out.println("[Controller] Rebalance thread interrupted.");
         } finally {
@@ -870,8 +866,9 @@ private static void balanceFileDistribution(Map<String, Set<Integer>> fileToActu
 
     for (int dstore : dstoreToFileCount.keySet()) {
         int count = dstoreToFileCount.get(dstore);
-        if (count > targetMax) overloaded.add(dstore);
+        if (count > targetMin)   overloaded.add(dstore);
         else if (count < targetMin) underloaded.add(dstore);
+
     }
 
     while (!overloaded.isEmpty() && !underloaded.isEmpty()) {
@@ -894,8 +891,9 @@ private static void balanceFileDistribution(Map<String, Set<Integer>> fileToActu
             break;
         }
 
-        if (dstoreToFileCount.get(from) > targetMax) overloaded.add(from);
-        if (dstoreToFileCount.get(to) < targetMin) underloaded.add(to);
+        if (dstoreToFileCount.get(from) > targetMin)   overloaded.add(from);
+        if (dstoreToFileCount.get(to)   < targetMin)   underloaded.add(to);
+
     }
 }
 
@@ -958,8 +956,11 @@ private static void waitForRebalanceAcks() {
  */
 private static void cleanupIndexIfNeeded(Map<String, Set<Integer>> fileToActualDstores) {
     for (String file : new ArrayList<>(fileStatus.keySet())) {
-        if (!fileToActualDstores.containsKey(file)) {
-            System.out.println("[Rebalance]  File " + file + " is in the index but not found on any Dstore. It should be removed from the index.");
+        FileStatus status = fileStatus.get(file);
+        Set<Integer> holders = fileToActualDstores.get(file);
+
+        if (status == FileStatus.STORE_COMPLETE && (holders == null || holders.isEmpty())) {
+            System.out.println("[Rebalance] File " + file + " is in the index but not found on any Dstore. Removing.");
             fileStatus.remove(file);
             fileToDstores.remove(file);
             fileSizes.remove(file);
